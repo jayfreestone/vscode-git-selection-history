@@ -1,0 +1,90 @@
+{
+  "name": "selection-history",
+  "displayName": "Git: History for Selection",
+  "description": "WebStorm-style 'Show History for Selection': arrow through the commits that touched the selected lines and see each diff.",
+  "version": "0.4.0",
+  "publisher": "jayf",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "SCM Providers"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "extensionDependencies": [
+    "vscode.git"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "selectionHistory.show",
+        "title": "Git: Show History for Selection"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "selectionHistory.show",
+        "key": "ctrl+alt+h",
+        "mac": "cmd+alt+h",
+        "when": "editorTextFocus && resourceScheme == file"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "selectionHistory.show",
+          "group": "9_cutcopypaste@99",
+          "when": "resourceScheme == file"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "History for Selection",
+      "properties": {
+        "selectionHistory.maxCommits": {
+          "type": "number",
+          "default": 200,
+          "description": "Maximum number of commits to load for a selection."
+        }
+      }
+    },
+    "viewsContainers": {
+      "panel": [
+        {
+          "id": "selectionHistory",
+          "title": "Selection History",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "selectionHistory": [
+        {
+          "type": "webview",
+          "id": "selectionHistory.panel",
+          "name": "History for Selection"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc -p . --noEmit",
+    "bundle": "esbuild src/extension.ts --bundle --platform=node --target=node18 --format=cjs --main-fields=module,main --external:vscode --sourcemap --outfile=out/extension.js && cp node_modules/vscode-oniguruma/release/onig.wasm out/",
+    "compile": "npm run typecheck && npm run bundle",
+    "package": "npm run compile && vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "jsonc-parser": "^3.3.1",
+    "vscode-oniguruma": "^2.0.1",
+    "vscode-textmate": "^9.3.2"
+  }
+}
