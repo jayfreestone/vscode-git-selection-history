@@ -18,7 +18,7 @@ export interface Hunk { oldStart: number; oldLen: number; newStart: number; newL
 export interface LineRange { start: number; end: number; } // 1-based, inclusive
 export interface DiffLine { kind: 'ctx' | 'add' | 'del'; text: string; }
 export interface DiffHunk extends Hunk { context: string; lines: DiffLine[]; }
-export interface Patch { oldPath: string; newPath: string; hunks: DiffHunk[]; oldRange?: LineRange; newRange?: LineRange; }
+export interface Patch { oldPath: string; newPath: string; hunks: DiffHunk[]; }
 
 /** Where a side of a diff comes from: a revision, the index, or the working tree. */
 export interface Side { type: 'rev' | 'index' | 'worktree'; ref?: string; path: string; }
@@ -35,8 +35,6 @@ export interface Entry {
   parents: string[];
   left?: Side;
   right: Side;
-  oldRange?: LineRange;
-  newRange?: LineRange;
   hunks: DiffHunk[];
 }
 
@@ -47,29 +45,33 @@ interface PanelState {
   entries: Entry[];
 }
 
-interface PanelContext { repoRoot: vscode.Uri; git: GitAPI; languageId: string; }
+/** What the panel needs to serve one lookup, including cached reads of the file's sides. */
+interface PanelContext {
+  repoRoot: vscode.Uri;
+  git: GitAPI;
+  languageId: string;
+  read(side: Side): Promise<string | undefined>;
+}
 
 const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)$/;
 const VIEW_ID = 'selectionHistory.panel';
+const DIFF_OPTS = ['--no-color', '--no-ext-diff', '--src-prefix=a/', '--dst-prefix=b/'];
 
 let panel: PanelProvider;
 
 export function activate(context: vscode.ExtensionContext) {
   const highlighter = new Highlighter(path.join(context.extensionPath, 'out', 'onig.wasm'));
   panel = new PanelProvider(context.extensionUri, highlighter);
-  const onThemeChange = () => { highlighter.reset(); panel.themeChanged(); };
   context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider(VIEW_ID, panel, { webviewOptions: { retainContextWhenHidden: true } }),
-    vscode.window.onDidChangeActiveColorTheme(onThemeChange),
-    vscode.workspace.onDidChangeConfiguration(e => { if (e.affectsConfiguration('workbench.colorTheme')) { onThemeChange(); } }),
-    vscode.commands.registerCommand('selectionHistory.show', () => show().catch(err => {
+    vscode.window.registerWebviewViewProvider(VIEW_ID, panel),
+    vscode.window.onDidChangeActiveColorTheme(() => { highlighter.reset(); panel.themeChanged(); }),
+    vscode.commands.registerCommand('selectionHistory.show', () => show().catch(async err => {
       const message = err instanceof Error ? err.message : String(err);
       panel.update({ title: 'History for Selection', status: 'error', message, entries: [] });
+      await panel.reveal();
     }))
   );
 }
-
-export function deactivate() {}
 
 async function show() {
   const editor = vscode.window.activeTextEditor;
@@ -94,13 +96,19 @@ async function show() {
   const root = repo.rootUri.fsPath;
   const relPath = path.relative(root, document.uri.fsPath).split(path.sep).join('/');
   const exec = (args: string[]) => run(git.git.path, root, args);
+  const read = sideReader(git.git.path, root);
 
   const fail = async (message: string) => {
     panel.update({ title: relPath, status: 'error', message, entries: [] });
     await panel.reveal();
   };
 
-  if (!(await exec(['ls-files', '--', relPath])).trim()) {
+  const [tracked, unstagedText, stagedText] = await Promise.all([
+    exec(['ls-files', '--', relPath]),
+    exec(['diff', '-U0', ...DIFF_OPTS, '--', relPath]),
+    exec(['diff', '-U0', ...DIFF_OPTS, '--cached', '--', relPath]),
+  ]);
+  if (!tracked.trim()) {
     await fail('This file is not tracked by Git yet.');
     return;
   }
@@ -113,8 +121,8 @@ async function show() {
   });
 
   // Working tree -> index -> HEAD. git log -L addresses lines in HEAD's version of the file.
-  const unstaged = parsePatch(await exec(['diff', '-U0', '--', relPath]), relPath).hunks;
-  const staged = parsePatch(await exec(['diff', '-U0', '--cached', '--', relPath]), relPath).hunks;
+  const unstaged = parsePatch(unstagedText, relPath).hunks;
+  const staged = parsePatch(stagedText, relPath).hunks;
   const indexRanges = wtRanges.map(r => mapRangeThrough(r, unstaged)).filter((r): r is LineRange => r !== null);
   const headRanges = indexRanges.map(r => mapRangeThrough(r, staged)).filter((r): r is LineRange => r !== null);
 
@@ -124,12 +132,12 @@ async function show() {
   const headSide: Side = { type: 'rev', ref: 'HEAD', path: relPath };
   const splitLines = (text: string | undefined) => (text ?? '').split(/\r?\n/);
   if (unstaged.some(h => wtRanges.some(r => intersects(h, r)))) {
-    const [oldText, newText] = await Promise.all([readSideContent(git.git.path, root, indexSide), readSideContent(git.git.path, root, worktreeSide)]);
+    const [oldText, newText] = await Promise.all([read(indexSide), read(worktreeSide)]);
     const hunks = wtRanges.map(r => windowHunk(r, unstaged, splitLines(oldText), splitLines(newText)));
     entries.push(workingEntry('unstaged', 'Unstaged changes', indexSide, worktreeSide, hunks));
   }
   if (staged.some(h => indexRanges.some(r => intersects(h, r)))) {
-    const [oldText, newText] = await Promise.all([readSideContent(git.git.path, root, headSide), readSideContent(git.git.path, root, indexSide)]);
+    const [oldText, newText] = await Promise.all([read(headSide), read(indexSide)]);
     const hunks = indexRanges.map(r => windowHunk(r, staged, splitLines(oldText), splitLines(newText)));
     entries.push(workingEntry('staged', 'Staged changes', headSide, indexSide, hunks));
   }
@@ -140,13 +148,13 @@ async function show() {
 
   const fmt = (r: LineRange) => r.start === r.end ? `L${r.start}` : `L${r.start}-${r.end}`;
   const title = `${relPath} ${wtRanges.map(fmt).join(', ')}`;
-  panel.setContext({ repoRoot: repo.rootUri, git, languageId: document.languageId });
+  panel.setContext({ repoRoot: repo.rootUri, git, languageId: document.languageId, read });
   panel.update({ title, status: 'loading', entries: [] });
   await panel.reveal();
 
   if (headRanges.length) {
     const max = vscode.workspace.getConfiguration('selectionHistory').get<number>('maxCommits', 200);
-    const args = ['log', '--no-color', '-n', String(max),
+    const args = ['log', ...DIFF_OPTS, '-n', String(max),
       '--format=%x1e%H%x00%h%x00%an%x00%ar%x00%as%x00%P%x00%s%x00%b%x1f'];
     for (const r of headRanges) { args.push('-L', `${r.start},${r.end}:${relPath}`); }
     entries.push(...parseLog(await exec(args), relPath));
@@ -155,23 +163,17 @@ async function show() {
 }
 
 function workingEntry(kind: 'unstaged' | 'staged', subject: string, left: Side, right: Side, hunks: DiffHunk[]): Entry {
-  const entry: Entry = { id: kind, kind, short: '', author: '', ago: 'now', date: '', subject, body: '', parents: [], left, right, hunks };
-  for (const h of hunks) {
-    if (h.newLen > 0) { entry.newRange = merge(entry.newRange, { start: h.newStart, end: h.newStart + h.newLen - 1 }); }
-    if (h.oldLen > 0) { entry.oldRange = merge(entry.oldRange, { start: h.oldStart, end: h.oldStart + h.oldLen - 1 }); }
-  }
-  return entry;
+  return { id: kind, kind, short: '', author: '', ago: 'now', date: '', subject, body: '', parents: [], left, right, hunks };
 }
 
 class PanelProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private state: PanelState = { title: 'History for Selection', status: 'ready', entries: [] };
   private ctx?: PanelContext;
-  private contentCache = new Map<string, Promise<string | undefined>>();
 
   constructor(private readonly extensionUri: vscode.Uri, private readonly highlighter: Highlighter) {}
 
-  setContext(ctx: PanelContext) { this.ctx = ctx; this.contentCache.clear(); }
+  setContext(ctx: PanelContext) { this.ctx = ctx; }
 
   update(state: PanelState) {
     this.state = state;
@@ -200,7 +202,7 @@ class PanelProvider implements vscode.WebviewViewProvider {
     view.webview.onDidReceiveMessage(async (msg: { type: string; id?: string }) => {
       switch (msg.type) {
         case 'ready':
-          view.webview.postMessage({ type: 'state', state: this.state });
+          this.update(this.state);
           break;
         case 'openDiff': {
           const entry = this.state.entries.find(e => e.id === msg.id);
@@ -209,10 +211,11 @@ class PanelProvider implements vscode.WebviewViewProvider {
         }
         case 'tokens': {
           const entry = this.state.entries.find(e => e.id === msg.id);
-          if (!entry || !this.ctx) { break; }
+          const ctx = this.ctx;
+          if (!entry || !ctx) { break; }
           const [left, right] = await Promise.all([
-            entry.left ? this.sideTokens(this.ctx, entry.left, oldLines(entry.hunks)) : {},
-            this.sideTokens(this.ctx, entry.right, newLines(entry.hunks)),
+            entry.left ? this.sideTokens(ctx, entry.left, sideRanges(entry.hunks, 'old')) : {},
+            this.sideTokens(ctx, entry.right, sideRanges(entry.hunks, 'new')),
           ]);
           view.webview.postMessage({ type: 'tokens', id: entry.id, left, right });
           break;
@@ -227,7 +230,7 @@ class PanelProvider implements vscode.WebviewViewProvider {
 
   private async sideTokens(ctx: PanelContext, side: Side, ranges: LineRange[]): Promise<Record<number, Span[]>> {
     if (!ranges.length) { return {}; }
-    const content = await this.readSide(ctx, side);
+    const content = await ctx.read(side);
     if (content === undefined) { return {}; }
     const lines = content.split(/\r?\n/);
     const upTo = Math.max(...ranges.map(r => r.end));
@@ -239,24 +242,23 @@ class PanelProvider implements vscode.WebviewViewProvider {
     }
     return out;
   }
-
-  private readSide(ctx: PanelContext, side: Side): Promise<string | undefined> {
-    const key = `${side.type}:${side.ref ?? ''}:${side.path}`;
-    let pending = this.contentCache.get(key);
-    if (!pending) {
-      pending = readSideContent(ctx.git.git.path, ctx.repoRoot.fsPath, side);
-      this.contentCache.set(key, pending);
-    }
-    return pending;
-  }
 }
 
-/** Full text of a file from a revision, the index, or the working tree; undefined if it cannot be read. */
-function readSideContent(gitPath: string, root: string, side: Side): Promise<string | undefined> {
-  return (side.type === 'worktree'
-    ? fs.promises.readFile(path.join(root, side.path), 'utf8')
-    : run(gitPath, root, ['show', `${side.type === 'index' ? '' : side.ref}:${side.path}`])
-  ).catch(() => undefined);
+/** Reads the full text of a file from a revision, the index, or the working tree, once per side. */
+function sideReader(gitPath: string, root: string): PanelContext['read'] {
+  const cache = new Map<string, Promise<string | undefined>>();
+  return side => {
+    const key = `${side.type}:${side.ref ?? ''}:${side.path}`;
+    let pending = cache.get(key);
+    if (!pending) {
+      pending = (side.type === 'worktree'
+        ? fs.promises.readFile(path.join(root, side.path), 'utf8')
+        : run(gitPath, root, ['show', `${side.type === 'index' ? '' : side.ref}:${side.path}`])
+      ).catch(() => undefined);
+      cache.set(key, pending);
+    }
+    return pending;
+  };
 }
 
 /**
@@ -274,7 +276,8 @@ export function windowHunk(range: LineRange, hunks: Hunk[], oldLines: string[], 
     if (kind !== 'add') { out.oldLen++; }
     if (kind !== 'del') { out.newLen++; }
   };
-  while (newNo <= range.end) {
+  // A pure deletion sits between new lines, so one just after `range.end` still belongs to it.
+  while (newNo <= range.end + 1) {
     const h = hunks[k];
     const atHunk = h && (h.newLen > 0 ? newNo === h.newStart : newNo === h.newStart + 1);
     if (atHunk) {
@@ -294,7 +297,7 @@ export function windowHunk(range: LineRange, hunks: Hunk[], oldLines: string[], 
       k++;
       continue;
     }
-    if (newNo >= range.start) { emit('ctx', newLines[newNo - 1] ?? '', oldNo); }
+    if (newNo >= range.start && newNo <= range.end) { emit('ctx', newLines[newNo - 1] ?? '', oldNo); }
     oldNo++;
     newNo++;
   }
@@ -302,11 +305,12 @@ export function windowHunk(range: LineRange, hunks: Hunk[], oldLines: string[], 
   return out;
 }
 
-function oldLines(hunks: DiffHunk[]): LineRange[] {
-  return hunks.filter(h => h.oldLen > 0).map(h => ({ start: h.oldStart, end: h.oldStart + h.oldLen - 1 }));
-}
-function newLines(hunks: DiffHunk[]): LineRange[] {
-  return hunks.filter(h => h.newLen > 0).map(h => ({ start: h.newStart, end: h.newStart + h.newLen - 1 }));
+/** The lines each hunk occupies on one side; hunks with nothing on that side are skipped. */
+export function sideRanges(hunks: Hunk[], side: 'old' | 'new'): LineRange[] {
+  return hunks.flatMap(h => {
+    const [start, len] = side === 'old' ? [h.oldStart, h.oldLen] : [h.newStart, h.newLen];
+    return len > 0 ? [{ start, end: start + len - 1 }] : [];
+  });
 }
 
 async function openNativeDiff(git: GitAPI, repoRoot: vscode.Uri, entry: Entry) {
@@ -315,11 +319,12 @@ async function openNativeDiff(git: GitAPI, repoRoot: vscode.Uri, entry: Entry) {
     return s.type === 'worktree' ? file : git.toGitUri(file, s.type === 'index' ? '' : s.ref ?? 'HEAD');
   };
   const right = uriFor(entry.right);
+  const touched = sideRanges(entry.hunks, 'new');
   const options: vscode.TextDocumentShowOptions = {
     preview: true,
     viewColumn: vscode.ViewColumn.Active,
-    selection: entry.newRange
-      ? new vscode.Range(entry.newRange.start - 1, 0, entry.newRange.end - 1, Number.MAX_SAFE_INTEGER)
+    selection: touched.length
+      ? new vscode.Range(Math.min(...touched.map(r => r.start)) - 1, 0, Math.max(...touched.map(r => r.end)) - 1, Number.MAX_SAFE_INTEGER)
       : undefined,
   };
   if (!entry.left) {
@@ -347,14 +352,6 @@ function run(gitPath: string, cwd: string, args: string[]): Promise<string> {
   });
 }
 
-function hunkFromMatch(m: RegExpExecArray): DiffHunk {
-  return {
-    oldStart: +m[1], oldLen: m[2] === undefined ? 1 : +m[2],
-    newStart: +m[3], newLen: m[4] === undefined ? 1 : +m[4],
-    context: m[5] ?? '', lines: [],
-  };
-}
-
 /** Parse one unified diff (a single file) into hunks with their lines. */
 export function parsePatch(text: string, fallbackPath: string): Patch {
   const patch: Patch = { oldPath: fallbackPath, newPath: fallbackPath, hunks: [] };
@@ -365,10 +362,12 @@ export function parsePatch(text: string, fallbackPath: string): Patch {
     else if (line.startsWith('@@')) {
       const m = HUNK_RE.exec(line);
       if (!m) { continue; }
-      current = hunkFromMatch(m);
+      current = {
+        oldStart: +m[1], oldLen: m[2] === undefined ? 1 : +m[2],
+        newStart: +m[3], newLen: m[4] === undefined ? 1 : +m[4],
+        context: m[5] ?? '', lines: [],
+      };
       patch.hunks.push(current);
-      if (current.newLen > 0) { patch.newRange = merge(patch.newRange, { start: current.newStart, end: current.newStart + current.newLen - 1 }); }
-      if (current.oldLen > 0) { patch.oldRange = merge(patch.oldRange, { start: current.oldStart, end: current.oldStart + current.oldLen - 1 }); }
     }
     else if (current && (line.startsWith(' ') || line.startsWith('+') || line.startsWith('-'))) {
       const kind = line[0] === ' ' ? 'ctx' : line[0] === '+' ? 'add' : 'del';
@@ -407,7 +406,6 @@ export function mapLineThrough(line: number, hunks: Hunk[]): number | null {
 }
 
 export function mapRangeThrough(range: LineRange, hunks: Hunk[]): LineRange | null {
-  if (hunks.length === 0) { return range; }
   let start: number | null = null;
   let end: number | null = null;
   for (let l = range.start; l <= range.end && start === null; l++) { start = mapLineThrough(l, hunks); }
@@ -427,16 +425,12 @@ export function parseLog(output: string, fallbackPath: string): Entry[] {
     const parentList = parents ? parents.split(' ').filter(Boolean) : [];
     const patch = parsePatch(patchText, fallbackPath);
     entries.push({
-      id: sha, kind: 'commit', sha, short, author, ago, date, subject: subject ?? '', body: (body ?? '').trim(),
+      id: sha, kind: 'commit', short, author, ago, date, subject: subject ?? '', body: (body ?? '').trim(),
       parents: parentList,
       left: parentList.length ? { type: 'rev', ref: parentList[0], path: patch.oldPath } : undefined,
       right: { type: 'rev', ref: sha, path: patch.newPath },
-      oldRange: patch.oldRange, newRange: patch.newRange, hunks: patch.hunks,
-    } as Entry & { sha: string });
+      hunks: patch.hunks,
+    });
   }
   return entries;
-}
-
-function merge(a: LineRange | undefined, b: LineRange): LineRange {
-  return a ? { start: Math.min(a.start, b.start), end: Math.max(a.end, b.end) } : b;
 }

@@ -6,8 +6,11 @@
   let pendingFocus = false;
   let tokens = {};          // entry id -> { left: {lineNo: spans}, right: {lineNo: spans} }
   let tokenTimer;
+  let firstState = true;
 
+  // Survives the panel being hidden and re-created: { commitsWidth, title, selected }.
   const saved = vscode.getState() || {};
+  const remember = patch => vscode.setState(Object.assign(saved, patch));
   if (saved.commitsWidth) { document.documentElement.style.setProperty('--commits-w', saved.commitsWidth + 'px'); }
 
   const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -131,6 +134,7 @@
   function select(i) {
     if (i < 0 || i >= state.entries.length || i === selected) { return; }
     selected = i;
+    remember({ selected });
     renderDetail();
   }
 
@@ -169,12 +173,13 @@
     splitter.addEventListener('pointerdown', e => {
       splitter.setPointerCapture(e.pointerId);
       splitter.classList.add('dragging');
+      let w;
       const move = ev => {
-        const w = Math.max(200, ev.clientX - commits.getBoundingClientRect().left);
+        w = Math.max(200, ev.clientX - commits.getBoundingClientRect().left);
         document.documentElement.style.setProperty('--commits-w', w + 'px');
-        vscode.setState({ ...(vscode.getState() || {}), commitsWidth: w });
       };
       const up = () => {
+        if (w) { remember({ commitsWidth: w }); }
         splitter.classList.remove('dragging');
         splitter.removeEventListener('pointermove', move);
         splitter.removeEventListener('pointerup', up);
@@ -187,9 +192,12 @@
   window.addEventListener('message', e => {
     const msg = e.data;
     if (msg.type === 'state') {
-      const changed = msg.state.title !== state.title || msg.state.status !== state.status || msg.state.entries !== state.entries;
       state = msg.state;
-      if (changed) { selected = 0; tokens = {}; }
+      // A re-created panel restores its row; every later update is a new lookup.
+      selected = firstState && state.title === saved.title ? saved.selected || 0 : 0;
+      firstState = false;
+      remember({ title: state.title, selected });
+      tokens = {};
       render();
     } else if (msg.type === 'tokens') {
       tokens[msg.id] = { left: msg.left || {}, right: msg.right || {} };

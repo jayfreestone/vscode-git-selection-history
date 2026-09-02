@@ -9,7 +9,7 @@
     "vscode": "^1.85.0"
   },
   "categories": [
-    "SCM Providers"
+    "Other"
   ],
   "activationEvents": [],
   "main": "./out/extension.js",
@@ -73,7 +73,9 @@
     "typecheck": "tsc -p . --noEmit",
     "bundle": "esbuild src/extension.ts --bundle --platform=node --target=node18 --format=cjs --main-fields=module,main --external:vscode --sourcemap --outfile=out/extension.js && cp node_modules/vscode-oniguruma/release/onig.wasm out/",
     "compile": "npm run typecheck && npm run bundle",
-    "package": "npm run compile && vsce package --no-dependencies"
+    "package": "npm run compile && vsce package --no-dependencies",
+    "test": "npm run bundle && node test/run.js",
+    "install-local": "npm run package && node scripts/install.js"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",

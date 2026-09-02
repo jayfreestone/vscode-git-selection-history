@@ -10,6 +10,23 @@ Keys inside the panel: Up/Down (also Home/End/PageUp/PageDown) move between entr
 
 Renames are followed. Selections are mapped working tree -> index -> HEAD, so uncommitted edits elsewhere in the file do not throw the history off.
 
-Syntax highlighting loads the TextMate grammar and colour theme from your installed extensions, so it matches the editor. Themes shipped as legacy `.tmTheme` files fall back to plain text.
+Syntax highlighting loads the TextMate grammar and colour theme from your installed extensions, so it matches the editor. Themes shipped as legacy `.tmTheme` files fall back to plain text. The theme is read from `workbench.colorTheme`, so with `window.autoDetectColorScheme` enabled the panel may use a different theme from the editor.
 
 Setting: `selectionHistory.maxCommits` (default 200).
+
+## Development
+
+Not published to the Marketplace. Build and install it locally:
+
+```bash
+npm install
+npm run install-local
+```
+
+That type-checks, bundles with esbuild into `out/`, packages a `.vsix`, and installs it into VS Code using the CLI inside the app bundle (set `VSCODE_CLI` if yours lives elsewhere, or pass `-- --cursor` for Cursor). Reload the VS Code window afterwards. Bump `version` in `package.json` when you want VS Code to treat it as an update.
+
+Other scripts:
+
+- `npm test` bundles and runs the unit tests in `test/run.js` (git parsing, line mapping, the webview renderer, and the highlighter against the grammars and themes installed with VS Code).
+- `npm run compile` type-checks and bundles only.
+- `npm run package` builds the `.vsix` without installing it.

@@ -20,7 +20,7 @@ interface ThemeJson { tokenColors: unknown[]; colors: Record<string, string>; }
  * so the panel's highlighting matches the user's editor exactly.
  */
 export class Highlighter {
-  private static wasmLoaded = false;
+  private static wasm?: Promise<void>;
   private ready?: Promise<void>;
   private registry?: Registry;
   private colorMap: string[] = [];
@@ -44,11 +44,8 @@ export class Highlighter {
   }
 
   private async doInit() {
-    if (!Highlighter.wasmLoaded) {
-      const buf = fs.readFileSync(this.wasmPath);
-      await loadWASM(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
-      Highlighter.wasmLoaded = true;
-    }
+    await (Highlighter.wasm ??= fs.promises.readFile(this.wasmPath)
+      .then(buf => loadWASM(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength))));
     this.scopeToPath.clear(); this.langToScope.clear(); this.injections.clear();
     for (const ext of vscode.extensions.all) {
       const grammars: any[] = ext.packageJSON?.contributes?.grammars ?? [];
@@ -70,7 +67,7 @@ export class Highlighter {
       loadGrammar: async scope => {
         const file = this.scopeToPath.get(scope);
         if (!file) { return null; }
-        try { return parseRawGrammar(fs.readFileSync(file, 'utf8'), file); } catch { return null; }
+        try { return parseRawGrammar(await fs.promises.readFile(file, 'utf8'), file); } catch { return null; }
       },
       getInjections: scope => this.injections.get(scope),
     });
